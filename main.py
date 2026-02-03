@@ -60,11 +60,16 @@ async def init_db():
     logging.info("✅ PostgreSQL таблицы проверены/созданы")
 
 # --- WEBHOOK СЕРВЕР ---
+# --- УНИВЕРСАЛЬНЫЙ ОБРАБОТЧИК ---
 async def handle_kie_callback(request):
+    # Логируем ВООБЩЕ всё, что прилетает
+    logging.info(f"📥 КТО-ТО ПРИСЛАЛ POST НА {request.path}")
+    
     try:
         data = await request.json()
-        logging.info(f"📥 CALLBACK: {data}")
+        logging.info(f"📥 ДАННЫЕ: {data}")
         
+        # Парсим ID и URL (добавил еще больше вариантов полей)
         task_id = data.get("taskId") or data.get("data", {}).get("taskId")
         video_url = data.get("url") or data.get("data", {}).get("url") or data.get("data", {}).get("video_url")
         state = str(data.get("state") or data.get("status") or data.get("data", {}).get("state")).lower()
@@ -76,16 +81,39 @@ async def handle_kie_callback(request):
             if row:
                 uid = row['user_id']
                 if state in ["succeeded", "success", "200", "complete"] and video_url:
+                    logging.info(f"✅ Отправляю видео пользователю {uid}")
                     await bot.send_video(uid, video_url, caption="✅ Видео готово!")
                     await conn.execute("UPDATE users SET attempts = attempts - 1 WHERE user_id = $1", uid)
                     await conn.execute("DELETE FROM tasks WHERE task_id = $1", task_id)
                 else:
-                    logging.warning(f"Task {task_id} not ready. State: {state}")
+                    logging.warning(f"⚠️ Задача {task_id} еще не готова. Статус: {state}")
+            else:
+                logging.error(f"❌ TaskID {task_id} не найден в БД!")
             await conn.close()
+        
         return web.Response(text="ok")
     except Exception as e:
-        logging.error(f"Callback error: {e}")
+        logging.error(f"💥 Ошибка в callback: {e}")
         return web.Response(text="error", status=500)
+
+async def main():
+    await init_db()
+    crypto = AioCryptoPay(token=CRYPTO_TOKEN, network=Networks.MAIN_NET)
+    
+    app = web.Application()
+    # ТЕПЕРЬ СЛУШАЕМ И ГЛАВНУЮ, И СПЕЦИАЛЬНУЮ ССЫЛКУ
+    app.router.add_post('/', handle_kie_callback)
+    app.router.add_post('/kie-callback', handle_kie_callback)
+    
+    # Для проверки в браузере (GET)
+    app.router.add_get('/', lambda r: web.Response(text="Server is UP"))
+    
+    runner = web.AppRunner(app)
+    await runner.setup()
+    await web.TCPSite(runner, '0.0.0.0', PORT).start()
+    
+    logging.info(f"🚀 СЕРВЕР ЗАПУЩЕН НА ПОРТУ {PORT}")
+    await dp.start_polling(bot, crypto=crypto)
 
 # --- ЗАПРОС К KIE AI ---
 async def create_kie_task(video_url: str, user_id: int):
