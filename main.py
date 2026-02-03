@@ -4,6 +4,7 @@ import os
 import sys
 import aiohttp
 import asyncpg
+import json # Добавь в импорты в самом верху файла!
 from aiohttp import web
 from aiogram import Bot, Dispatcher, F, types
 from aiogram.filters import CommandStart, Command
@@ -66,37 +67,60 @@ async def init_db():
         logging.error(f"❌ ОШИБКА БД: {e}")
 
 # --- ОБРАБОТЧИК CALLBACK (ПРИЕМ ВИДЕО) ---
+
+
 async def handle_kie_callback(request):
     logging.info(f"🌐 ПОЛУЧЕН ВХОДЯЩИЙ POST НА {request.path}")
     try:
-        body = await request.text()
-        logging.info(f"📥 СЫРЫЕ ДАННЫЕ ОТ KIE AI: {body}")
-        
         data = await request.json()
+        logging.info(f"📥 ДАННЫЕ ОТ KIE: {data}")
+        
+        # 1. Извлекаем taskId
         task_id = data.get("taskId") or data.get("data", {}).get("taskId")
-        video_url = data.get("url") or data.get("data", {}).get("url") or data.get("data", {}).get("video_url")
+        
+        # 2. Извлекаем статус
         state = str(data.get("state") or data.get("status") or data.get("data", {}).get("state")).lower()
+        
+        # 3. СЛОЖНЫЙ ПАРСИНГ ССЫЛКИ (Специально под твои логи)
+        video_url = None
+        
+        # Сначала ищем в корне
+        video_url = data.get("url") or data.get("data", {}).get("url")
+        
+        # Если нет, лезем в resultJson (как в твоем логе)
+        if not video_url:
+            res_json_str = data.get("data", {}).get("resultJson")
+            if res_json_str:
+                try:
+                    res_data = json.loads(res_json_str)
+                    urls = res_data.get("resultUrls", [])
+                    if urls:
+                        video_url = urls[0]
+                except Exception as je:
+                    logging.error(f"Ошибка парсинга resultJson: {je}")
 
-        if task_id:
+        logging.info(f"🔎 ПАРСИНГ ИТОГ: TaskID={task_id}, State={state}, URL={video_url}")
+
+        if task_id and video_url:
             conn = await asyncpg.connect(DATABASE_URL)
             row = await conn.fetchrow("SELECT user_id FROM tasks WHERE task_id = $1", task_id)
             
             if row:
                 uid = row['user_id']
-                if state in ["succeeded", "success", "200", "complete"] and video_url:
-                    logging.info(f"✅ ВИДЕО ГОТОВО. Отправляю юзеру {uid}")
-                    await bot.send_video(uid, video_url, caption="✅ Видео готово!")
+                if state in ["success", "succeeded", "complete"]:
+                    logging.info(f"✅ ОТПРАВЛЯЮ ВИДЕО ЮЗЕРУ {uid}")
+                    await bot.send_video(uid, video_url, caption="✅ Твоё видео без водяного знака!")
                     await conn.execute("UPDATE users SET attempts = attempts - 1 WHERE user_id = $1", uid)
                     await conn.execute("DELETE FROM tasks WHERE task_id = $1", task_id)
                 else:
-                    logging.warning(f"⚠️ Статус задачи {task_id}: {state}")
+                    logging.warning(f"⚠️ Задача {task_id} в статусе: {state}")
             else:
-                logging.error(f"❌ TaskID {task_id} не найден в базе данных!")
+                logging.error(f"❌ Юзер для задачи {task_id} не найден в БД")
             await conn.close()
-        
+            
         return web.Response(text="ok")
     except Exception as e:
-        logging.error(f"💥 ОШИБКА В CALLBACK: {e}")
+        logging.error(f"💥 КРИТИЧЕСКАЯ ОШИБКА CALLBACK: {e}")
         return web.Response(text="error", status=500)
 
 # --- СОЗДАНИЕ ЗАДАЧИ ---
