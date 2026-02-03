@@ -3,7 +3,7 @@ import logging
 import os
 import sys
 import aiohttp
-import aiosqlite
+import asyncpg
 from aiohttp import web
 from aiogram import Bot, Dispatcher, F, types
 from aiogram.filters import CommandStart, Command
@@ -12,7 +12,7 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from aiocryptopay import AioCryptoPay, Networks
 
-# --- ЗАГРУЗКА ПЕРЕМЕННЫХ ИЗ RAILWAY ---
+# --- ПЕРЕМЕННЫЕ ИЗ RAILWAY ---
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CRYPTO_TOKEN = os.getenv("CRYPTO_TOKEN")
 KIE_AI_KEY = os.getenv("KIE_AI_KEY")
@@ -20,19 +20,13 @@ ADMIN_ID = int(os.getenv("ADMIN_ID", 0))
 CHANNEL_ID = os.getenv("CHANNEL_ID")
 CHANNEL_URL = os.getenv("CHANNEL_URL")
 WEBHOOK_URL = os.getenv("WEBHOOK_URL")
+DATABASE_URL = os.getenv("DATABASE_URL") # Берем URL твоей базы PostgreSQL
 PORT = int(os.getenv("PORT", 8080))
 
-DB_NAME = "bot_database.db"
-
-# --- ИНИЦИАЛИЗАЦИЯ ---
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(message)s",
-    handlers=[logging.StreamHandler(sys.stdout)]
-)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(message)s")
 
 class States(StatesGroup):
     pkg_name = State()
@@ -41,79 +35,59 @@ class States(StatesGroup):
     give_user_id = State()
     give_amount = State()
 
-# --- АВТОМАТИЧЕСКОЕ СОЗДАНИЕ ТАБЛИЦ ---
+# --- РАБОТА С POSTGRESQL ---
 async def init_db():
-    async with aiosqlite.connect(DB_NAME) as db:
-        # Таблица юзеров
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS users (
-                user_id INTEGER PRIMARY KEY, 
-                attempts INTEGER DEFAULT 0, 
-                received_free_bonus BOOLEAN DEFAULT 0
-            )
-        """)
-        # Таблица пакетов
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS packages (
-                id INTEGER PRIMARY KEY AUTOINCREMENT, 
-                name TEXT, 
-                attempts INTEGER, 
-                price_usd REAL
-            )
-        """)
-        # Таблица активных задач (Критично для Callback!)
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS tasks (
-                task_id TEXT PRIMARY KEY, 
-                user_id INTEGER
-            )
-        """)
-        await db.commit()
-    logging.info("✅ База данных и таблицы успешно инициализированы")
+    conn = await asyncpg.connect(DATABASE_URL)
+    # Создаем таблицы в твоей базе на Railway
+    await conn.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            user_id BIGINT PRIMARY KEY,
+            attempts INTEGER DEFAULT 0,
+            received_free_bonus BOOLEAN DEFAULT FALSE
+        );
+        CREATE TABLE IF NOT EXISTS packages (
+            id SERIAL PRIMARY KEY,
+            name TEXT,
+            attempts INTEGER,
+            price_usd REAL
+        );
+        CREATE TABLE IF NOT EXISTS tasks (
+            task_id TEXT PRIMARY KEY,
+            user_id BIGINT
+        );
+    """)
+    await conn.close()
+    logging.info("✅ PostgreSQL таблицы проверены/созданы")
 
-# --- WEBHOOK СЕРВЕР ДЛЯ KIE AI ---
+# --- WEBHOOK СЕРВЕР ---
 async def handle_kie_callback(request):
-    logging.info(f"🌐 Входящий запрос на Webhook: {request.method}")
     try:
         data = await request.json()
-        logging.info(f"📥 ПОЛУЧЕН CALLBACK ОТ KIE AI: {data}")
+        logging.info(f"📥 CALLBACK: {data}")
         
-        # Парсим данные (Kie AI может присылать по-разному)
         task_id = data.get("taskId") or data.get("data", {}).get("taskId")
         video_url = data.get("url") or data.get("data", {}).get("url") or data.get("data", {}).get("video_url")
         state = str(data.get("state") or data.get("status") or data.get("data", {}).get("state")).lower()
 
-        if not task_id:
-            logging.error("❌ В callback нет taskId")
-            return web.Response(text="no taskid", status=400)
-
-        async with aiosqlite.connect(DB_NAME) as db:
-            cursor = await db.execute("SELECT user_id FROM tasks WHERE task_id = ?", (task_id,))
-            row = await cursor.fetchone()
+        if task_id:
+            conn = await asyncpg.connect(DATABASE_URL)
+            row = await conn.fetchrow("SELECT user_id FROM tasks WHERE task_id = $1", task_id)
             
             if row:
-                uid = row[0]
+                uid = row['user_id']
                 if state in ["succeeded", "success", "200", "complete"] and video_url:
-                    logging.info(f"👤 Юзер {uid} найден. Отправка видео...")
-                    try:
-                        await bot.send_video(uid, video_url, caption="✅ Видео без водяного знака готово!")
-                        await db.execute("UPDATE users SET attempts = attempts - 1 WHERE user_id = ?", (uid,))
-                        await db.execute("DELETE FROM tasks WHERE task_id = ?", (task_id,))
-                        await db.commit()
-                        logging.info("🎉 Видео успешно доставлено.")
-                    except Exception as e:
-                        logging.error(f"❌ Ошибка отправки в TG: {e}")
+                    await bot.send_video(uid, video_url, caption="✅ Видео готово!")
+                    await conn.execute("UPDATE users SET attempts = attempts - 1 WHERE user_id = $1", uid)
+                    await conn.execute("DELETE FROM tasks WHERE task_id = $1", task_id)
                 else:
-                    logging.warning(f"⚠️ Статус задачи не успех: {state}")
-            else:
-                logging.error(f"❌ taskId {task_id} не найден в БД. Бот мог перезагрузиться и стереть файл БД.")
-        
+                    logging.warning(f"Task {task_id} not ready. State: {state}")
+            await conn.close()
         return web.Response(text="ok")
     except Exception as e:
-        logging.error(f"💥 Критическая ошибка в Callback: {e}")
+        logging.error(f"Callback error: {e}")
         return web.Response(text="error", status=500)
 
-# --- ОТПРАВКА ЗАДАЧИ В KIE AI ---
+# --- ЗАПРОС К KIE AI ---
 async def create_kie_task(video_url: str, user_id: int):
     api_url = "https://api.kie.ai/api/v1/jobs/createTask"
     headers = {"Authorization": f"Bearer {KIE_AI_KEY}", "Content-Type": "application/json"}
@@ -123,146 +97,140 @@ async def create_kie_task(video_url: str, user_id: int):
         "callBackUrl": WEBHOOK_URL
     }
     
-    logging.info(f"📤 Отправка в Kie AI для {user_id}. Callback: {WEBHOOK_URL}")
     async with aiohttp.ClientSession() as session:
-        try:
-            async with session.post(api_url, json=payload, headers=headers) as resp:
-                res = await resp.json()
-                logging.info(f"📥 Ответ создания: {res}")
-                if resp.status == 200 and res.get("code") == 200:
-                    tid = res["data"]["taskId"]
-                    async with aiosqlite.connect(DB_NAME) as db:
-                        await db.execute("INSERT INTO tasks (task_id, user_id) VALUES (?, ?)", (tid, user_id))
-                        await db.commit()
-                    return True
-                return False
-        except Exception as e:
-            logging.error(f"❌ Ошибка API: {e}")
+        async with session.post(api_url, json=payload, headers=headers) as resp:
+            res = await resp.json()
+            if resp.status == 200 and res.get("code") == 200:
+                tid = res["data"]["taskId"]
+                conn = await asyncpg.connect(DATABASE_URL)
+                await conn.execute("INSERT INTO tasks (task_id, user_id) VALUES ($1, $2)", tid, user_id)
+                await conn.close()
+                return True
             return False
 
-# --- ХЕНДЛЕРЫ БОТА ---
+# --- ХЕНДЛЕРЫ ---
 @dp.message(CommandStart())
 async def cmd_start(m: types.Message):
-    async with aiosqlite.connect(DB_NAME) as db:
-        await db.execute("INSERT OR IGNORE INTO users (user_id) VALUES (?)", (m.from_user.id,))
-        await db.commit()
+    conn = await asyncpg.connect(DATABASE_URL)
+    await conn.execute("INSERT INTO users (user_id) VALUES ($1) ON CONFLICT (user_id) DO NOTHING", m.from_user.id)
+    await conn.close()
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🎁 Бонус", callback_data="bonus")],
-        [InlineKeyboardButton(text="💳 Пополнить", callback_data="shop")]
+        [InlineKeyboardButton(text="💳 Магазин", callback_data="shop")]
     ])
-    await m.answer(f"Привет! Присылай ссылку на видео.\nПодпишись на {CHANNEL_URL}", reply_markup=kb)
+    await m.answer(f"Присылай ссылку на видео.\nТвой ID: {m.from_user.id}", reply_markup=kb)
 
 @dp.message(F.text.regexp(r'https?://'))
 async def handle_url(m: types.Message):
-    async with aiosqlite.connect(DB_NAME) as db:
-        async with db.execute("SELECT attempts FROM users WHERE user_id = ?", (m.from_user.id,)) as cur:
-            u = await cur.fetchone()
+    conn = await asyncpg.connect(DATABASE_URL)
+    user = await conn.fetchrow("SELECT attempts FROM users WHERE user_id = $1", m.from_user.id)
+    await conn.close()
     
-    if not u or u[0] <= 0:
-        return await m.answer("❌ У вас закончились попытки!")
+    if not user or user['attempts'] <= 0:
+        return await m.answer("❌ Нет попыток!")
     
-    wait_msg = await m.answer("⏳ Видео обрабатывается... Я пришлю результат сразу после готовности.")
+    msg = await m.answer("⏳ Обрабатываю...")
     if not await create_kie_task(m.text, m.from_user.id):
-        await wait_msg.edit_text("❌ Ошибка сервиса Kie AI. Попробуйте позже.")
+        await msg.edit_text("❌ Ошибка API.")
 
-# --- ОСТАЛЬНОЕ (БОНУСЫ, АДМИНКА, ОПЛАТА) ---
 @dp.callback_query(F.data == "bonus")
 async def get_bonus(c: types.CallbackQuery):
     try:
-        user_channel_status = await bot.get_chat_member(CHANNEL_ID, c.from_user.id)
-        if user_channel_status.status in ["member", "administrator", "creator"]:
-            async with aiosqlite.connect(DB_NAME) as db:
-                cur = await db.execute("SELECT received_free_bonus FROM users WHERE user_id = ?", (c.from_user.id,))
-                row = await cur.fetchone()
-                if row and row[0]: return await c.answer("Вы уже получили бонус!", show_alert=True)
-                await db.execute("UPDATE users SET attempts = attempts + 1, received_free_bonus = 1 WHERE user_id = ?", (c.from_user.id,))
-                await db.commit()
-                await c.message.answer("✅ Бонус зачислен!")
-        else: await c.answer("Сначала подпишись!", show_alert=True)
-    except: await c.answer("Ошибка подписки", show_alert=True)
+        status = await bot.get_chat_member(CHANNEL_ID, c.from_user.id)
+        if status.status in ["member", "administrator", "creator"]:
+            conn = await asyncpg.connect(DATABASE_URL)
+            row = await conn.fetchrow("SELECT received_free_bonus FROM users WHERE user_id = $1", c.from_user.id)
+            if row and row['received_free_bonus']:
+                await c.answer("Уже брали!", show_alert=True)
+            else:
+                await conn.execute("UPDATE users SET attempts = attempts + 1, received_free_bonus = TRUE WHERE user_id = $1", c.from_user.id)
+                await c.message.answer("✅ +1 попытка!")
+            await conn.close()
+        else:
+            await c.answer("Подпишись на канал!", show_alert=True)
+    except:
+        await c.answer("Ошибка подписки", show_alert=True)
 
 @dp.callback_query(F.data == "shop")
 async def shop(c: types.CallbackQuery):
-    async with aiosqlite.connect(DB_NAME) as db:
-        async with db.execute("SELECT id, name, price_usd FROM packages") as cur:
-            pkgs = await cur.fetchall()
-    kb = [[InlineKeyboardButton(text=f"{p[1]} - ${p[2]}", callback_data=f"buy_{p[0]}")] for p in pkgs]
-    await c.message.answer("Выберите тариф:", reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
+    conn = await asyncpg.connect(DATABASE_URL)
+    pkgs = await conn.fetch("SELECT id, name, price_usd FROM packages")
+    await conn.close()
+    kb = [[InlineKeyboardButton(text=f"{p['name']} - ${p['price_usd']}", callback_data=f"buy_{p['id']}")] for p in pkgs]
+    await c.message.answer("Тарифы:", reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
 
 @dp.callback_query(F.data.startswith("buy_"))
 async def buy(c: types.CallbackQuery, crypto: AioCryptoPay):
-    pid = c.data.split("_")[1]
-    async with aiosqlite.connect(DB_NAME) as db:
-        async with db.execute("SELECT price_usd, attempts FROM packages WHERE id = ?", (pid,)) as cur:
-            p = await cur.fetchone()
-    inv = await crypto.create_invoice(asset='USDT', amount=p[0])
+    pid = int(c.data.split("_")[1])
+    conn = await asyncpg.connect(DATABASE_URL)
+    p = await conn.fetchrow("SELECT price_usd, attempts FROM packages WHERE id = $1", pid)
+    await conn.close()
+    inv = await crypto.create_invoice(asset='USDT', amount=p['price_usd'])
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="Оплатить", url=inv.bot_invoice_url)],
-        [InlineKeyboardButton(text="Проверить", callback_data=f"check_{inv.invoice_id}_{p[1]}")]
+        [InlineKeyboardButton(text="Проверить", callback_data=f"check_{inv.invoice_id}_{p['attempts']}")]
     ])
-    await c.message.answer(f"Счет на {p[0]} USDT", reply_markup=kb)
+    await c.message.answer(f"Счет: {p['price_usd']} USDT", reply_markup=kb)
 
 @dp.callback_query(F.data.startswith("check_"))
 async def check_p(c: types.CallbackQuery, crypto: AioCryptoPay):
     _, iid, att = c.data.split("_")
     res = await crypto.get_invoices(invoice_ids=int(iid))
     if res and res[0].status == 'paid':
-        async with aiosqlite.connect(DB_NAME) as db:
-            await db.execute("UPDATE users SET attempts = attempts + ? WHERE user_id = ?", (int(att), c.from_user.id))
-            await db.commit()
-        await c.message.answer("✅ Оплата прошла!")
-    else: await c.answer("Не оплачено", show_alert=True)
+        conn = await asyncpg.connect(DATABASE_URL)
+        await conn.execute("UPDATE users SET attempts = attempts + $1 WHERE user_id = $2", int(att), c.from_user.id)
+        await conn.close()
+        await c.message.answer("✅ Оплачено!")
+    else:
+        await c.answer("Не найдено", show_alert=True)
 
+# --- АДМИНКА ---
 @dp.message(Command("admin"), F.from_user.id == ADMIN_ID)
-async def admin_menu(m: types.Message):
+async def admin(m: types.Message):
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="💰 Создать пакет", callback_data="adm_pkg")],
-        [InlineKeyboardButton(text="➕ Выдать попытки", callback_data="adm_give")]
+        [InlineKeyboardButton(text="➕ Пакет", callback_data="adm_p"), InlineKeyboardButton(text="👤 Выдать", callback_data="adm_g")]
     ])
-    await m.answer("Админка:", reply_markup=kb)
+    await m.answer("Админ:", reply_markup=kb)
 
-@dp.callback_query(F.data == "adm_pkg", F.from_user.id == ADMIN_ID)
-async def pkg_1(c: types.CallbackQuery, state: FSMContext):
+@dp.callback_query(F.data == "adm_p", F.from_user.id == ADMIN_ID)
+async def adm_p1(c: types.CallbackQuery, state: FSMContext):
     await state.set_state(States.pkg_name); await c.message.answer("Имя:")
 @dp.message(States.pkg_name)
-async def pkg_2(m: types.Message, state: FSMContext):
+async def adm_p2(m: types.Message, state: FSMContext):
     await state.update_data(n=m.text); await state.set_state(States.pkg_att); await m.answer("Попытки:")
 @dp.message(States.pkg_att)
-async def pkg_3(m: types.Message, state: FSMContext):
+async def adm_p3(m: types.Message, state: FSMContext):
     await state.update_data(a=m.text); await state.set_state(States.pkg_price); await m.answer("Цена:")
 @dp.message(States.pkg_price)
-async def pkg_4(m: types.Message, state: FSMContext):
+async def adm_p4(m: types.Message, state: FSMContext):
     d = await state.get_data()
-    async with aiosqlite.connect(DB_NAME) as db:
-        await db.execute("INSERT INTO packages (name, attempts, price_usd) VALUES (?, ?, ?)", (d['n'], int(d['a']), float(m.text)))
-        await db.commit()
-    await m.answer("Готово!"); await state.clear()
+    conn = await asyncpg.connect(DATABASE_URL)
+    await conn.execute("INSERT INTO packages (name, attempts, price_usd) VALUES ($1, $2, $3)", d['n'], int(d['a']), float(m.text))
+    await conn.close()
+    await m.answer("Создано!"); await state.clear()
 
-@dp.callback_query(F.data == "adm_give", F.from_user.id == ADMIN_ID)
-async def adm_1(c: types.CallbackQuery, state: FSMContext):
+@dp.callback_query(F.data == "adm_g", F.from_user.id == ADMIN_ID)
+async def adm_g1(c: types.CallbackQuery, state: FSMContext):
     await state.set_state(States.give_user_id); await c.message.answer("ID юзера:")
 @dp.message(States.give_user_id)
-async def adm_2(m: types.Message, state: FSMContext):
+async def adm_g2(m: types.Message, state: FSMContext):
     await state.update_data(uid=m.text); await state.set_state(States.give_amount); await m.answer("Сколько?")
 @dp.message(States.give_amount)
-async def adm_3(m: types.Message, state: FSMContext):
+async def adm_g3(m: types.Message, state: FSMContext):
     d = await state.get_data()
-    async with aiosqlite.connect(DB_NAME) as db:
-        await db.execute("UPDATE users SET attempts = attempts + ? WHERE user_id = ?", (int(m.text), int(d['uid'])))
-        await db.commit()
+    conn = await asyncpg.connect(DATABASE_URL)
+    await conn.execute("UPDATE users SET attempts = attempts + $1 WHERE user_id = $2", int(m.text), int(d['uid']))
+    await conn.close()
     await m.answer("Выдано!"); await state.clear()
 
-# --- ЗАПУСК ---
 async def main():
     await init_db()
     crypto = AioCryptoPay(token=CRYPTO_TOKEN, network=Networks.MAIN_NET)
     app = web.Application()
     app.router.add_post('/kie-callback', handle_kie_callback)
-    app.router.add_get('/kie-callback', lambda r: web.Response(text="Webhook Server is Running"))
     runner = web.AppRunner(app)
     await runner.setup()
     await web.TCPSite(runner, '0.0.0.0', PORT).start()
-    logging.info(f"🚀 Сервер запущен на порту {PORT}")
     await dp.start_polling(bot, crypto=crypto)
 
 if __name__ == "__main__":
