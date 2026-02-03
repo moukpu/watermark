@@ -198,11 +198,21 @@ async def check_bonus(c: types.CallbackQuery):
 @dp.message(F.text == "💳 Купить попытки")
 async def shop_btn(m: types.Message):
     conn = await asyncpg.connect(DATABASE_URL)
-    pkgs = await conn.fetch("SELECT id, name, price_usd FROM packages ORDER BY price_usd")
+    # Запрашиваем данные о пакетах
+    pkgs = await conn.fetch("SELECT id, name, price_usd, attempts FROM packages ORDER BY price_usd ASC")
     await conn.close()
-    if not pkgs: return await m.answer("Магазин пуст.")
-    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=f"{p['name']} — ${p['price_usd']}", callback_data=f"buy_{p['id']}")] for p in pkgs])
-    await m.answer("Выберите тариф:", reply_markup=kb)
+    
+    if not pkgs: 
+        return await m.answer("Магазин пока пуст. Администратор скоро добавит пакеты!")
+    
+    # Формируем кнопки: Название - Цена $ - Кол-во попыток
+    buttons = []
+    for p in pkgs:
+        text = f"{p['name']} — {p['price_usd']}$ — {p['attempts']} поп."
+        buttons.append([InlineKeyboardButton(text=text, callback_data=f"buy_{p['id']}")])
+    
+    kb = InlineKeyboardMarkup(inline_keyboard=buttons)
+    await m.answer("Выберите подходящий пакет для пополнения баланса:", reply_markup=kb)
 
 # --- АДМИНКА ---
 @dp.message(Command("admin"), F.from_user.id == ADMIN_ID)
