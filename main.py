@@ -37,14 +37,9 @@ class States(StatesGroup):
     add_token_val = State()
     add_token_name = State()
 
-# --- СИЛОВОЕ ОБНОВЛЕНИЕ БД ---
+# --- ИНИЦИАЛИЗАЦИЯ БД ---
 async def init_db():
     conn = await asyncpg.connect(DATABASE_URL)
-    
-    # ВНИМАНИЕ: Если ты ловишь ошибки UndefinedColumn, 
-    # раскомментируй строку ниже на ОДИН запуск, чтобы сбросить таблицы:
-    # await conn.execute("DROP TABLE IF EXISTS tasks, tokens, packages CASCADE")
-
     await conn.execute("""
         CREATE TABLE IF NOT EXISTS users (
             user_id BIGINT PRIMARY KEY,
@@ -69,17 +64,8 @@ async def init_db():
             token_used TEXT
         );
     """)
-
-    # Принудительно добавляем колонки в существующие таблицы (на всякий случай)
-    try:
-        await conn.execute("ALTER TABLE tokens ADD COLUMN IF NOT EXISTS name TEXT")
-        await conn.execute("ALTER TABLE tokens ADD COLUMN IF NOT EXISTS usage_count INTEGER DEFAULT 0")
-        await conn.execute("ALTER TABLE tasks ADD COLUMN IF NOT EXISTS token_used TEXT")
-    except Exception as e:
-        logging.info(f"Синхронизация колонок: {e}")
-
     await conn.close()
-    logging.info("✅ База данных готова к работе")
+    logging.info("✅ База данных готова")
 
 # --- КЛАВИАТУРА ---
 def main_kb():
@@ -90,11 +76,11 @@ def main_kb():
 
 async def get_active_token():
     conn = await asyncpg.connect(DATABASE_URL)
-    row = await conn.fetchrow("SELECT token FROM tokens WHERE is_active = TRUE ORDER BY usage_count ASC LIMIT 1")
+    row = await conn.fetchrow("SELECT token, name FROM tokens WHERE is_active = TRUE ORDER BY usage_count ASC LIMIT 1")
     await conn.close()
-    return row['token'] if row else None
+    return row if row else None
 
-# --- CALLBACK ОБРАБОТЧИК ---
+# --- CALLBACK (WEBHOOK) ---
 async def handle_kie_callback(request):
     try:
         data = await request.json()
@@ -119,15 +105,65 @@ async def handle_kie_callback(request):
                 await conn.execute("DELETE FROM tasks WHERE task_id = $1", task_id)
             await conn.close()
         return web.Response(text="ok")
-    except: return web.Response(text="error")
+    except Exception as e:
+        logging.error(f"Webhook error: {e}")
+        return web.Response(text="error")
 
-# --- ХЕНДЛЕРЫ ---
+# --- ОБРАБОТКА ССЫЛКИ ---
+@dp.message(F.text.regexp(r'https?://'))
+async def handle_url(m: types.Message):
+    conn = await asyncpg.connect(DATABASE_URL)
+    u = await conn.fetchrow("SELECT attempts FROM users WHERE user_id = $1", m.from_user.id)
+    await conn.close()
+    
+    if not u or u['attempts'] <= 0:
+        return await m.answer("❌ У тебя закончились попытки. Пополни баланс в магазине!")
+    
+    token_row = await get_active_token()
+    if not token_row:
+        await m.answer("⚠️ Техническая ошибка. Пожалуйста, попробуй позже.")
+        return await bot.send_message(ADMIN_ID, "‼️ **КРИТИЧЕСКАЯ ОШИБКА**\nНет активных токенов в базе данных! Бот не может работать.")
+
+    token = token_row['token']
+    token_name = token_row['name']
+    
+    msg = await m.answer("⏳ Начинаю обработку видео...")
+    
+    api_url = "https://api.kie.ai/api/v1/jobs/createTask"
+    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+    payload = {"model": "sora-watermark-remover", "input": {"video_url": m.text}, "callBackUrl": WEBHOOK_URL}
+    
+    async with aiohttp.ClientSession() as session:
+        try:
+            async with session.post(api_url, json=payload, headers=headers) as resp:
+                res = await resp.json()
+                if resp.status == 200 and res.get("code") == 200:
+                    conn = await asyncpg.connect(DATABASE_URL)
+                    await conn.execute("INSERT INTO tasks (task_id, user_id, token_used) VALUES ($1, $2, $3)", 
+                                     res["data"]["taskId"], m.from_user.id, token)
+                    await conn.close()
+                else:
+                    # Ошибка API (лимиты, невалидный ключ и т.д.)
+                    await msg.edit_text("⚠️ Техническая ошибка. Мы уже сообщили администратору.")
+                    await bot.send_message(ADMIN_ID, 
+                        f"🚨 **ОШИБКА ТОКЕНА**\n\n"
+                        f"**Имя:** {token_name}\n"
+                        f"**Токен:** `{token[:15]}...`\n"
+                        f"**Статус:** {resp.status}\n"
+                        f"**Ответ:** `{res}`\n\n"
+                        f"Совет: Проверь лимиты и при необходимости выключи этот токен в /admin."
+                    )
+        except Exception as e:
+            await msg.edit_text("⚠️ Техническая ошибка. Попробуй позже.")
+            await bot.send_message(ADMIN_ID, f"💥 **Ошибка сети при запросе к Kie AI**:\n`{e}`")
+
+# --- ОСТАЛЬНЫЕ ХЕНДЛЕРЫ ---
 @dp.message(CommandStart())
 async def cmd_start(m: types.Message):
     conn = await asyncpg.connect(DATABASE_URL)
     await conn.execute("INSERT INTO users (user_id) VALUES ($1) ON CONFLICT DO NOTHING", m.from_user.id)
     await conn.close()
-    await m.answer("Бот запущен! Воспользуйся меню ниже.", reply_markup=main_kb())
+    await m.answer("Привет! Пришли ссылку на видео, чтобы убрать водяной знак.", reply_markup=main_kb())
 
 @dp.message(F.text == "👤 Профиль")
 async def profile(m: types.Message):
@@ -142,69 +178,40 @@ async def bonus_info(m: types.Message):
         [InlineKeyboardButton(text="🔗 Подписаться", url=CHANNEL_URL)],
         [InlineKeyboardButton(text="✅ Проверить", callback_data="check_bonus")]
     ])
-    await m.answer("Подпишись на канал и получи +1 попытку!", reply_markup=kb)
+    await m.answer("Подпишись на наш канал и получи бонусную попытку!", reply_markup=kb)
 
 @dp.callback_query(F.data == "check_bonus")
 async def check_bonus(c: types.CallbackQuery):
-    try:
-        status = await bot.get_chat_member(CHANNEL_ID, c.from_user.id)
-        if status.status in ["member", "administrator", "creator"]:
-            conn = await asyncpg.connect(DATABASE_URL)
-            row = await conn.fetchrow("SELECT received_free_bonus FROM users WHERE user_id = $1", c.from_user.id)
-            if row and row['received_free_bonus']:
-                await c.answer("❌ Ты уже получал бонус!", show_alert=True)
-            else:
-                await conn.execute("UPDATE users SET attempts = attempts + 1, received_free_bonus = TRUE WHERE user_id = $1", c.from_user.id)
-                await c.message.answer("✅ Тебе начислена 1 попытка!")
-            await conn.close()
+    status = await bot.get_chat_member(CHANNEL_ID, c.from_user.id)
+    if status.status in ["member", "administrator", "creator"]:
+        conn = await asyncpg.connect(DATABASE_URL)
+        row = await conn.fetchrow("SELECT received_free_bonus FROM users WHERE user_id = $1", c.from_user.id)
+        if row and row['received_free_bonus']:
+            await c.answer("❌ Ты уже получал бонус!", show_alert=True)
         else:
-            await c.answer("❌ Сначала подпишись!", show_alert=True)
-    except:
-        await c.answer("Бот не админ в канале!", show_alert=True)
+            await conn.execute("UPDATE users SET attempts = attempts + 1, received_free_bonus = TRUE WHERE user_id = $1", c.from_user.id)
+            await c.message.answer("✅ Бонус зачислен!")
+        await conn.close()
+    else:
+        await c.answer("❌ Сначала подпишись!", show_alert=True)
 
 @dp.message(F.text == "💳 Купить попытки")
 async def shop_btn(m: types.Message):
     conn = await asyncpg.connect(DATABASE_URL)
-    pkgs = await conn.fetch("SELECT id, name, price_usd FROM packages ORDER BY price_usd ASC")
+    pkgs = await conn.fetch("SELECT id, name, price_usd FROM packages ORDER BY price_usd")
     await conn.close()
     if not pkgs: return await m.answer("Магазин пуст.")
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=f"{p['name']} — ${p['price_usd']}", callback_data=f"buy_{p['id']}")] for p in pkgs
-    ])
-    await m.answer("Выберите пакет видео:", reply_markup=kb)
-
-@dp.message(F.text.regexp(r'https?://'))
-async def handle_url(m: types.Message):
-    conn = await asyncpg.connect(DATABASE_URL)
-    u = await conn.fetchrow("SELECT attempts FROM users WHERE user_id = $1", m.from_user.id)
-    await conn.close()
-    if not u or u['attempts'] <= 0: return await m.answer("❌ Нет попыток.")
-    
-    token = await get_active_token()
-    if not token: return await m.answer("❌ Нет активных ключей API.")
-
-    msg = await m.answer("⏳ Обрабатываю...")
-    api_url = "https://api.kie.ai/api/v1/jobs/createTask"
-    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
-    payload = {"model": "sora-watermark-remover", "input": {"video_url": m.text}, "callBackUrl": WEBHOOK_URL}
-    
-    async with aiohttp.ClientSession() as session:
-        async with session.post(api_url, json=payload, headers=headers) as resp:
-            res = await resp.json()
-            if resp.status == 200 and res.get("code") == 200:
-                conn = await asyncpg.connect(DATABASE_URL)
-                await conn.execute("INSERT INTO tasks (task_id, user_id, token_used) VALUES ($1, $2, $3)", res["data"]["taskId"], m.from_user.id, token)
-                await conn.close()
-            else: await msg.edit_text("❌ Ошибка API.")
+    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=f"{p['name']} — ${p['price_usd']}", callback_data=f"buy_{p['id']}")] for p in pkgs])
+    await m.answer("Выберите тариф:", reply_markup=kb)
 
 # --- АДМИНКА ---
 @dp.message(Command("admin"), F.from_user.id == ADMIN_ID)
-async def admin_panel(m: types.Message):
+async def admin_main(m: types.Message):
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🔑 Упр. Токенами", callback_data="adm_tok_list")],
+        [InlineKeyboardButton(text="🔑 Токены", callback_data="adm_tok_list")],
         [InlineKeyboardButton(text="➕ Добавить токен", callback_data="adm_tok_add")],
         [InlineKeyboardButton(text="👤 Выдать попытки", callback_data="adm_g")],
-        [InlineKeyboardButton(text="📦 Создать пакет", callback_data="adm_pkg_add")]
+        [InlineKeyboardButton(text="📦 Пакет", callback_data="adm_pkg_add")]
     ])
     await m.answer("🛠 Админ-панель", reply_markup=kb)
 
@@ -213,12 +220,12 @@ async def adm_tok_list(c: types.CallbackQuery):
     conn = await asyncpg.connect(DATABASE_URL)
     rows = await conn.fetch("SELECT name, usage_count, is_active, token FROM tokens")
     await conn.close()
-    if not rows: return await c.answer("Токенов нет.", show_alert=True)
+    if not rows: return await c.answer("Токенов нет.")
     for r in rows:
         status = "✅" if r['is_active'] else "❌"
         txt = "Выключить" if r['is_active'] else "Включить"
         kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=txt, callback_data=f"toggle_tok_{r['token']}")]])
-        await c.message.answer(f"🏷 {r['name']} | {status}\n📊 Использовано: {r['usage_count']}", reply_markup=kb)
+        await c.message.answer(f"🏷 {r['name']} | {status}\n📊 Использовано: {r['usage_count']}\n`{r['token'][:20]}...`", reply_markup=kb)
 
 @dp.callback_query(F.data.startswith("toggle_tok_"))
 async def toggle_tok(c: types.CallbackQuery):
@@ -245,13 +252,13 @@ async def tok_add_3(m: types.Message, state: FSMContext):
 
 @dp.callback_query(F.data == "adm_pkg_add")
 async def pkg_add_1(c: types.CallbackQuery, state: FSMContext):
-    await state.set_state(States.pkg_name); await c.message.answer("Имя (напр. 10 видео):")
+    await state.set_state(States.pkg_name); await c.message.answer("Имя:")
 @dp.message(States.pkg_name)
 async def pkg_add_2(m: types.Message, state: FSMContext):
     await state.update_data(n=m.text); await state.set_state(States.pkg_att); await m.answer("Попыток:")
 @dp.message(States.pkg_att)
 async def pkg_add_3(m: types.Message, state: FSMContext):
-    await state.update_data(a=m.text); await state.set_state(States.pkg_price); await m.answer("Цена (USD):")
+    await state.update_data(a=m.text); await state.set_state(States.pkg_price); await m.answer("Цена:")
 @dp.message(States.pkg_price)
 async def pkg_add_4(m: types.Message, state: FSMContext):
     d = await state.get_data()
@@ -281,10 +288,7 @@ async def buy_proc(c: types.CallbackQuery, crypto: AioCryptoPay):
     p = await conn.fetchrow("SELECT price_usd, attempts FROM packages WHERE id = $1", pid)
     await conn.close()
     inv = await crypto.create_invoice(asset='USDT', amount=p['price_usd'])
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="💳 Оплатить", url=inv.bot_invoice_url)],
-        [InlineKeyboardButton(text="✅ Проверить", callback_data=f"check_{inv.invoice_id}_{p['attempts']}")]
-    ])
+    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="💳 Оплатить", url=inv.bot_invoice_url)], [InlineKeyboardButton(text="✅ Проверить", callback_data=f"check_{inv.invoice_id}_{p['attempts']}")]])
     await c.message.answer(f"Счет на {p['price_usd']} USDT", reply_markup=kb)
 
 @dp.callback_query(F.data.startswith("check_"))
@@ -295,7 +299,7 @@ async def check_p(c: types.CallbackQuery, crypto: AioCryptoPay):
         conn = await asyncpg.connect(DATABASE_URL)
         await conn.execute("UPDATE users SET attempts = attempts + $1 WHERE user_id = $2", int(att), c.from_user.id)
         await conn.close()
-        await c.message.answer("✅ Попытки начислены!")
+        await c.message.answer("✅ Попытки добавлены!")
     else: await c.answer("Не оплачено", show_alert=True)
 
 async def main():
