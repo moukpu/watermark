@@ -302,12 +302,30 @@ async def buy_att(c: types.CallbackQuery, crypto: AioCryptoPay):
 
 @dp.callback_query(F.data.startswith("chk_"))
 async def chk_pay(c: types.CallbackQuery, crypto: AioCryptoPay):
-    _, iid, att = c.data.split("_"); res = await crypto.get_invoices(invoice_ids=int(iid))
-    if res and res[0].status == 'paid':
-        conn = await asyncpg.connect(DATABASE_URL)
-        await conn.execute("UPDATE users SET attempts = attempts + $1, total_donated = total_donated + $2 WHERE user_id = $3", int(att), res[0].amount, c.from_user.id)
-        await conn.close(); await c.message.answer("✅ Success! Attempts added.")
-    else: await c.answer("Not paid yet.", show_alert=True)
+    _, iid, att = c.data.split("_")
+    try:
+        # Получаем инвойс. Библиотека возвращает список, если передано несколько ID, 
+        # или один объект, если ID один. Проверяем статус корректно.
+        res = await crypto.get_invoices(invoice_ids=int(iid))
+        
+        # Если пришел список — берем первый элемент, если объект — работаем напрямую
+        invoice = res[0] if isinstance(res, list) else res
+        
+        if invoice and invoice.status == 'paid':
+            conn = await asyncpg.connect(DATABASE_URL)
+            await conn.execute(
+                "UPDATE users SET attempts = attempts + $1, total_donated = total_donated + $2 WHERE user_id = $3", 
+                int(att), float(invoice.amount), c.from_user.id
+            )
+            await conn.close()
+            await c.message.answer("✅ Payment confirmed! Your attempts have been added.")
+        else:
+            # Если статус не 'paid'
+            await c.message.answer("❌ Payment not found. Please make sure you have completed the transaction.")
+            
+    except Exception as e:
+        logging.error(f"Payment check error: {e}")
+        await c.message.answer("⚠️ Sorry, there was an error checking your payment. Please try again in a moment.")
 
 async def main():
     await init_db(); crypto = AioCryptoPay(token=CRYPTO_TOKEN, network=Networks.MAIN_NET)
